@@ -23,13 +23,17 @@ import java.util.Map;
 public class AutoBoatMod implements ClientModInitializer {
 
     private static boolean active = false;
+    private static boolean avoid = true;                  // объезжать преграды
     private static Double targetX = null, targetZ = null; // режим "к точке"
-    private static Float fixedYaw = null;                 // режим "по стороне света"
+    private static Float fixedYaw = null;                 // режим "курс" (сторона света / прямо)
     private static boolean keysHeld = false;
+    private static float lastYaw = 0f;
 
     private static final double LOOK_AHEAD = 8.0;
     private static final double BOAT_HALF_WIDTH = 1.0;
-    private static final float TURN_DEADZONE = 4f;
+    // Подкрути, если виляет (больше) или не доворачивает (меньше)
+    private static final float INERTIA = 6f;
+    private static final float DEADZONE = 3f;
 
     @Override
     public void onInitializeClient() {
@@ -68,6 +72,33 @@ public class AutoBoatMod implements ClientModInitializer {
                 }));
             }
             root.then(dir);
+
+            // /autoboat straight — ехать прямо по текущему курсу лодки
+            root.then(ClientCommandManager.literal("straight").executes(ctx -> {
+                Minecraft mc = Minecraft.getInstance();
+                if (mc.player != null && mc.player.getVehicle() instanceof Boat b) {
+                    fixedYaw = b.getYRot();
+                    targetX = targetZ = null;
+                    active = true;
+                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: еду прямо"));
+                } else {
+                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: сначала сядь в лодку"));
+                }
+                return 1;
+            }));
+
+            // /autoboat avoid <on|off>
+            root.then(ClientCommandManager.literal("avoid")
+                .then(ClientCommandManager.literal("on").executes(ctx -> {
+                    avoid = true;
+                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: объезд включён"));
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("off").executes(ctx -> {
+                    avoid = false;
+                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: объезд выключен"));
+                    return 1;
+                })));
 
             // /autoboat stop
             root.then(ClientCommandManager.literal("stop").executes(ctx -> {
@@ -120,16 +151,27 @@ public class AutoBoatMod implements ClientModInitializer {
             desired = fixedYaw;
         }
 
-        // Ближайший к желаемому курсу свободный угол: 0, ±15, ±30 ... ±135
+        // Выбор курса: если объезд выключен — строго по желаемому
         Float chosen = null;
-        for (int off = 0; off <= 135; off += 15) {
-            if (isClear(mc.level, boat, desired + off)) { chosen = desired + off; break; }
-            if (off != 0 && isClear(mc.level, boat, desired - off)) { chosen = desired - off; break; }
+        if (!avoid) {
+            chosen = desired;
+        } else {
+            // Ближайший к желаемому курсу свободный угол: 0, ±15, ±30 ... ±135
+            for (int off = 0; off <= 135; off += 15) {
+                if (isClear(mc.level, boat, desired + off)) { chosen = desired + off; break; }
+                if (off != 0 && isClear(mc.level, boat, desired - off)) { chosen = desired - off; break; }
+            }
         }
 
         Options o = mc.options;
+        float yaw = boat.getYRot();
+        if (!keysHeld) lastYaw = yaw;
         keysHeld = true;
         o.keyDown.setDown(false);
+
+        // Скорость вращения лодки (градусов за тик) — чтобы не проскакивать курс
+        float rate = Mth.wrapDegrees(yaw - lastYaw);
+        lastYaw = yaw;
 
         if (chosen == null) {
             // Всё перекрыто — крутимся на месте без газа
@@ -139,9 +181,11 @@ public class AutoBoatMod implements ClientModInitializer {
             return;
         }
 
-        float diff = Mth.wrapDegrees(chosen - boat.getYRot());
-        o.keyRight.setDown(diff > TURN_DEADZONE);
-        o.keyLeft.setDown(diff < -TURN_DEADZONE);
+        float diff = Mth.wrapDegrees(chosen - yaw);
+        // Ориентируемся на то, куда лодка докрутится по инерции
+        float predicted = diff - rate * INERTIA;
+        o.keyRight.setDown(predicted > DEADZONE);
+        o.keyLeft.setDown(predicted < -DEADZONE);
         // Если надо сильно развернуться — не газуем
         o.keyUp.setDown(Math.abs(diff) < 60f);
     }
