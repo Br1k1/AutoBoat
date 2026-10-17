@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "autoboat",
+  "version": "1.0.0",
+  "name": "AutoBoat",
+  "description": "Автопилот для лодки: едет к точке или по стороне света и объезжает преграды.",
+  "environment": "client",
+  "entrypoints": { "client": ["ru.autoboat.AutoBoatMod"] },
+  "depends": {
+    "fabricloader": ">=0.14.21",
+    "minecraft": "~1.20.1",
+    "fabric-api": "*"
+  }
+}
