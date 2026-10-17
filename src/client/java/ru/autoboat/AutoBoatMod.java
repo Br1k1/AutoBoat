@@ -36,13 +36,21 @@ public class AutoBoatMod implements ClientModInitializer {
     private static boolean tracking = false;
     private static float lastYaw = 0f;
 
+    // Запоминание выбранного обхода (чтобы не дёргаться)
+    private static float lastOffset = 0f;
+    private static int holdTicks = 0;
+
     private static KeyMapping pauseKey;
 
-    private static final double LOOK_AHEAD = 8.0;
+    // ===== НАСТРОЙКИ =====
+    private static final double LOOK_AHEAD = 12.0;   // на сколько блоков вперёд смотрим
     private static final double BOAT_HALF_WIDTH = 1.0;
-    // Подкрути, если виляет (больше) или не доворачивает (меньше)
-    private static final float INERTIA = 6f;
-    private static final float DEADZONE = 3f;
+    // Физика лодки: одно нажатие руля даёт ~10° поворота с учётом инерции.
+    // INERTIA = во сколько раз скорость вращения влияет на "докрутку" (≈9).
+    // DEADZONE = половина шага руля (≈5°). Если виляет — увеличь DEADZONE до 6-7.
+    private static final float INERTIA = 9f;
+    private static final float DEADZONE = 5f;
+    private static final int HOLD_AVOID_TICKS = 30;  // сколько тиков держать выбранный обход
 
     @Override
     public void onInitializeClient() {
@@ -63,6 +71,7 @@ public class AutoBoatMod implements ClientModInitializer {
                     targetZ = DoubleArgumentType.getDouble(ctx, "z");
                     fixedYaw = null;
                     straightMode = false;
+                    resetAvoid();
                     active = true;
                     ctx.getSource().sendFeedback(Component.literal("AutoBoat: еду к " + targetX + ", " + targetZ));
                     return 1;
@@ -81,6 +90,7 @@ public class AutoBoatMod implements ClientModInitializer {
                     fixedYaw = e.getValue();
                     targetX = targetZ = null;
                     straightMode = false;
+                    resetAvoid();
                     active = true;
                     ctx.getSource().sendFeedback(Component.literal("AutoBoat: курс " + e.getKey()));
                     return 1;
@@ -95,6 +105,7 @@ public class AutoBoatMod implements ClientModInitializer {
                     fixedYaw = b.getYRot();
                     targetX = targetZ = null;
                     straightMode = true;
+                    resetAvoid();
                     active = true;
                     ctx.getSource().sendFeedback(Component.literal("AutoBoat: еду прямо (X — пауза для коррекции)"));
                 } else {
@@ -127,6 +138,11 @@ public class AutoBoatMod implements ClientModInitializer {
         });
     }
 
+    private static void resetAvoid() {
+        lastOffset = 0f;
+        holdTicks = 0;
+    }
+
     private static void stop(Minecraft mc) {
         active = false;
         straightMode = false;
@@ -134,6 +150,7 @@ public class AutoBoatMod implements ClientModInitializer {
         tracking = false;
         targetX = targetZ = null;
         fixedYaw = null;
+        resetAvoid();
         releaseKeys(mc);
     }
 
@@ -170,6 +187,7 @@ public class AutoBoatMod implements ClientModInitializer {
         if (pauseKey.isDown()) {
             releaseKeys(mc);
             wasPaused = true;
+            resetAvoid();
             return;
         }
         if (wasPaused) {
@@ -196,16 +214,28 @@ public class AutoBoatMod implements ClientModInitializer {
             desired = fixedYaw;
         }
 
-        // Выбор курса: если объезд выключен — строго по желаемому
+        // Выбор курса
         Float chosen = null;
         if (!avoid) {
             chosen = desired;
         } else {
-            // Ближайший к желаемому курсу свободный угол: 0, ±15, ±30 ... ±135
-            for (int off = 0; off <= 135; off += 15) {
-                if (isClear(mc.level, boat, desired + off)) { chosen = desired + off; break; }
-                if (off != 0 && isClear(mc.level, boat, desired - off)) { chosen = desired - off; break; }
+            Float off = null;
+            // Держим ранее выбранный обход, пока он свободен (чтобы не метаться)
+            if (holdTicks > 0 && isClear(mc.level, boat, desired + lastOffset)) {
+                off = lastOffset;
+                holdTicks--;
+            } else {
+                // Ближайший к желаемому курсу свободный угол: 0, ±15, ±30 ... ±135
+                for (int a = 0; a <= 135; a += 15) {
+                    if (isClear(mc.level, boat, desired + a)) { off = (float) a; break; }
+                    if (a != 0 && isClear(mc.level, boat, desired - a)) { off = (float) -a; break; }
+                }
+                if (off != null) {
+                    lastOffset = off;
+                    holdTicks = (off == 0f) ? 0 : HOLD_AVOID_TICKS;
+                }
             }
+            if (off != null) chosen = desired + off;
         }
 
         Options o = mc.options;
@@ -221,7 +251,7 @@ public class AutoBoatMod implements ClientModInitializer {
         }
 
         float diff = Mth.wrapDegrees(chosen - yaw);
-        // Ориентируемся на то, куда лодка докрутится по инерции
+        // Куда лодка докрутится по инерции, если сейчас отпустить руль
         float predicted = diff - rate * INERTIA;
         o.keyRight.setDown(predicted > DEADZONE);
         o.keyLeft.setDown(predicted < -DEADZONE);
