@@ -28,7 +28,7 @@ public class AutoBoatMod implements ClientModInitializer {
 
     private static boolean active = false;
     private static boolean avoid = true;                  // объезжать преграды
-    private static boolean straightMode = false;          // режим "прямо" (курс обновляется после паузы)
+    private static boolean straightMode = false;          // режим "прямо"
     private static Double targetX = null, targetZ = null; // режим "к точке"
     private static Float fixedYaw = null;                 // режим "курс"
     private static boolean keysHeld = false;
@@ -40,23 +40,28 @@ public class AutoBoatMod implements ClientModInitializer {
     private static float lastOffset = 0f;
     private static int holdTicks = 0;
 
-    private static KeyMapping pauseKey;
+    private static KeyMapping pauseKey;     // X — зажать для ручной коррекции
+    private static KeyMapping straightKey;  // R — ехать прямо / выключить
+    private static KeyMapping stopKey;      // C — выключить автопилот
 
-    // ===== НАСТРОЙКИ =====
-    private static final double LOOK_AHEAD = 12.0;   // на сколько блоков вперёд смотрим
+    // ===== НАСТРОЙКИ (резкий поворот) =====
+    private static final double LOOK_AHEAD = 16.0;   // на сколько блоков вперёд смотрим
     private static final double BOAT_HALF_WIDTH = 1.0;
-    // Физика лодки: одно нажатие руля даёт ~10° поворота с учётом инерции.
-    // INERTIA = во сколько раз скорость вращения влияет на "докрутку" (≈9).
-    // DEADZONE = половина шага руля (≈5°). Если виляет — увеличь DEADZONE до 6-7.
-    private static final float INERTIA = 9f;
-    private static final float DEADZONE = 5f;
-    private static final int HOLD_AVOID_TICKS = 30;  // сколько тиков держать выбранный обход
+    // INERTIA меньше = руль держится дольше, поворот резче (но может проскакивать курс)
+    // DEADZONE меньше = точнее курс (но руль чаще подёргивается)
+    private static final float INERTIA = 5f;
+    private static final float DEADZONE = 3f;
+    private static final int HOLD_AVOID_TICKS = 20;  // сколько тиков держать выбранный обход
+    private static final float GAS_CUTOFF = 100f;    // при большем угле газ сбрасывается
 
     @Override
     public void onInitializeClient() {
-        // Клавиша паузы: по умолчанию X (зажать — ручное управление)
         pauseKey = KeyBindingHelper.registerKeyBinding(
-            new KeyMapping("AutoBoat: пауза", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_X, "AutoBoat"));
+            new KeyMapping("AutoBoat: пауза (зажать)", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_X, "AutoBoat"));
+        straightKey = KeyBindingHelper.registerKeyBinding(
+            new KeyMapping("AutoBoat: ехать прямо", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_R, "AutoBoat"));
+        stopKey = KeyBindingHelper.registerKeyBinding(
+            new KeyMapping("AutoBoat: выключить", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_C, "AutoBoat"));
 
         ClientTickEvents.END_CLIENT_TICK.register(AutoBoatMod::tick);
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
@@ -100,17 +105,7 @@ public class AutoBoatMod implements ClientModInitializer {
 
             // /autoboat straight — ехать прямо по текущему курсу лодки
             root.then(ClientCommandManager.literal("straight").executes(ctx -> {
-                Minecraft mc = Minecraft.getInstance();
-                if (mc.player != null && mc.player.getVehicle() instanceof Boat b) {
-                    fixedYaw = b.getYRot();
-                    targetX = targetZ = null;
-                    straightMode = true;
-                    resetAvoid();
-                    active = true;
-                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: еду прямо (X — пауза для коррекции)"));
-                } else {
-                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: сначала сядь в лодку"));
-                }
+                startStraight(Minecraft.getInstance());
                 return 1;
             }));
 
@@ -136,6 +131,19 @@ public class AutoBoatMod implements ClientModInitializer {
 
             dispatcher.register(root);
         });
+    }
+
+    private static void startStraight(Minecraft mc) {
+        if (mc.player != null && mc.player.getVehicle() instanceof Boat b) {
+            fixedYaw = b.getYRot();
+            targetX = targetZ = null;
+            straightMode = true;
+            resetAvoid();
+            active = true;
+            mc.player.displayClientMessage(Component.literal("AutoBoat: еду прямо"), true);
+        } else if (mc.player != null) {
+            mc.player.displayClientMessage(Component.literal("AutoBoat: сначала сядь в лодку"), true);
+        }
     }
 
     private static void resetAvoid() {
@@ -165,7 +173,28 @@ public class AutoBoatMod implements ClientModInitializer {
     }
 
     private static void tick(Minecraft mc) {
-        if (!active || mc.player == null || mc.level == null) {
+        if (mc.player == null || mc.level == null) {
+            tracking = false;
+            return;
+        }
+
+        // Клавиши управления (работают всегда)
+        while (straightKey.consumeClick()) {
+            if (active && straightMode) {
+                stop(mc);
+                mc.player.displayClientMessage(Component.literal("AutoBoat: выключен"), true);
+            } else {
+                startStraight(mc);
+            }
+        }
+        while (stopKey.consumeClick()) {
+            if (active) {
+                stop(mc);
+                mc.player.displayClientMessage(Component.literal("AutoBoat: выключен"), true);
+            }
+        }
+
+        if (!active) {
             tracking = false;
             return;
         }
@@ -255,8 +284,8 @@ public class AutoBoatMod implements ClientModInitializer {
         float predicted = diff - rate * INERTIA;
         o.keyRight.setDown(predicted > DEADZONE);
         o.keyLeft.setDown(predicted < -DEADZONE);
-        // Если надо сильно развернуться — не газуем
-        o.keyUp.setDown(Math.abs(diff) < 60f);
+        // Не сбрасываем газ на дуге, только на очень больших углах
+        o.keyUp.setDown(Math.abs(diff) < GAS_CUTOFF);
     }
 
     /** Свободен ли путь по этому углу (3 луча: центр и оба борта). */
