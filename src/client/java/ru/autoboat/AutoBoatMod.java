@@ -43,6 +43,8 @@ public class AutoBoatMod implements ClientModInitializer {
     private static KeyMapping pauseKey;     // X — зажать для ручной коррекции
     private static KeyMapping straightKey;  // R — ехать прямо / выключить
     private static KeyMapping stopKey;      // C — выключить автопилот
+    private static boolean prevStraight = false;
+    private static boolean prevStop = false;
 
     // ===== НАСТРОЙКИ (резкий поворот) =====
     private static final double LOOK_AHEAD = 16.0;   // на сколько блоков вперёд смотрим
@@ -56,12 +58,13 @@ public class AutoBoatMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        // Названия без двоеточий (двоеточие ломает options.txt)
         pauseKey = KeyBindingHelper.registerKeyBinding(
-            new KeyMapping("AutoBoat: пауза (зажать)", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_X, "AutoBoat"));
+            new KeyMapping("AutoBoat Pause (hold)", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_X, "AutoBoat"));
         straightKey = KeyBindingHelper.registerKeyBinding(
-            new KeyMapping("AutoBoat: ехать прямо", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_R, "AutoBoat"));
+            new KeyMapping("AutoBoat Straight", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_R, "AutoBoat"));
         stopKey = KeyBindingHelper.registerKeyBinding(
-            new KeyMapping("AutoBoat: выключить", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_C, "AutoBoat"));
+            new KeyMapping("AutoBoat Stop", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_C, "AutoBoat"));
 
         ClientTickEvents.END_CLIENT_TICK.register(AutoBoatMod::tick);
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
@@ -133,6 +136,15 @@ public class AutoBoatMod implements ClientModInitializer {
         });
     }
 
+    /** Нажата ли клавиша, привязанная к этому действию (читаем напрямую, без конфликтов). */
+    private static boolean isDown(long window, KeyMapping km) {
+        InputConstants.Key k = KeyBindingHelper.getBoundKeyOf(km);
+        if (k.getType() != InputConstants.Type.KEYSYM || k.getValue() == InputConstants.UNKNOWN.getValue()) {
+            return false;
+        }
+        return InputConstants.isKeyDown(window, k.getValue());
+    }
+
     private static void startStraight(Minecraft mc) {
         if (mc.player != null && mc.player.getVehicle() instanceof Boat b) {
             fixedYaw = b.getYRot();
@@ -178,8 +190,15 @@ public class AutoBoatMod implements ClientModInitializer {
             return;
         }
 
-        // Клавиши управления (работают всегда)
-        while (straightKey.consumeClick()) {
+        // Читаем клавиши напрямую; в меню/чате не реагируем
+        long win = mc.getWindow().getWindow();
+        boolean inGame = mc.screen == null;
+        boolean straightDown = inGame && isDown(win, straightKey);
+        boolean stopDown = inGame && isDown(win, stopKey);
+        boolean pauseDown = inGame && isDown(win, pauseKey);
+
+        // R — по нажатию (фронт)
+        if (straightDown && !prevStraight) {
             if (active && straightMode) {
                 stop(mc);
                 mc.player.displayClientMessage(Component.literal("AutoBoat: выключен"), true);
@@ -187,12 +206,15 @@ public class AutoBoatMod implements ClientModInitializer {
                 startStraight(mc);
             }
         }
-        while (stopKey.consumeClick()) {
+        // C — по нажатию (фронт)
+        if (stopDown && !prevStop) {
             if (active) {
                 stop(mc);
                 mc.player.displayClientMessage(Component.literal("AutoBoat: выключен"), true);
             }
         }
+        prevStraight = straightDown;
+        prevStop = stopDown;
 
         if (!active) {
             tracking = false;
@@ -213,7 +235,7 @@ public class AutoBoatMod implements ClientModInitializer {
         lastYaw = yaw;
 
         // Пауза: пока зажата клавиша — рулишь сам
-        if (pauseKey.isDown()) {
+        if (pauseDown) {
             releaseKeys(mc);
             wasPaused = true;
             resetAvoid();
