@@ -1,5 +1,6 @@
 package ru.autoboat;
 
+import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.fabricmc.api.ClientModInitializer;
@@ -7,6 +8,8 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 import net.minecraft.core.BlockPos;
@@ -16,6 +19,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.entity.vehicle.Boat;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
+import org.lwjgl.glfw.GLFW;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -24,10 +28,15 @@ public class AutoBoatMod implements ClientModInitializer {
 
     private static boolean active = false;
     private static boolean avoid = true;                  // объезжать преграды
+    private static boolean straightMode = false;          // режим "прямо" (курс обновляется после паузы)
     private static Double targetX = null, targetZ = null; // режим "к точке"
-    private static Float fixedYaw = null;                 // режим "курс" (сторона света / прямо)
+    private static Float fixedYaw = null;                 // режим "курс"
     private static boolean keysHeld = false;
+    private static boolean wasPaused = false;
+    private static boolean tracking = false;
     private static float lastYaw = 0f;
+
+    private static KeyMapping pauseKey;
 
     private static final double LOOK_AHEAD = 8.0;
     private static final double BOAT_HALF_WIDTH = 1.0;
@@ -37,6 +46,10 @@ public class AutoBoatMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        // Клавиша паузы: по умолчанию X (зажать — ручное управление)
+        pauseKey = KeyBindingHelper.registerKeyBinding(
+            new KeyMapping("AutoBoat: пауза", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_X, "AutoBoat"));
+
         ClientTickEvents.END_CLIENT_TICK.register(AutoBoatMod::tick);
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             LiteralArgumentBuilder<FabricClientCommandSource> root = ClientCommandManager.literal("autoboat");
@@ -49,6 +62,7 @@ public class AutoBoatMod implements ClientModInitializer {
                     targetX = DoubleArgumentType.getDouble(ctx, "x");
                     targetZ = DoubleArgumentType.getDouble(ctx, "z");
                     fixedYaw = null;
+                    straightMode = false;
                     active = true;
                     ctx.getSource().sendFeedback(Component.literal("AutoBoat: еду к " + targetX + ", " + targetZ));
                     return 1;
@@ -66,6 +80,7 @@ public class AutoBoatMod implements ClientModInitializer {
                 dir.then(ClientCommandManager.literal(e.getKey()).executes(ctx -> {
                     fixedYaw = e.getValue();
                     targetX = targetZ = null;
+                    straightMode = false;
                     active = true;
                     ctx.getSource().sendFeedback(Component.literal("AutoBoat: курс " + e.getKey()));
                     return 1;
@@ -79,8 +94,9 @@ public class AutoBoatMod implements ClientModInitializer {
                 if (mc.player != null && mc.player.getVehicle() instanceof Boat b) {
                     fixedYaw = b.getYRot();
                     targetX = targetZ = null;
+                    straightMode = true;
                     active = true;
-                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: еду прямо"));
+                    ctx.getSource().sendFeedback(Component.literal("AutoBoat: еду прямо (X — пауза для коррекции)"));
                 } else {
                     ctx.getSource().sendFeedback(Component.literal("AutoBoat: сначала сядь в лодку"));
                 }
@@ -113,6 +129,9 @@ public class AutoBoatMod implements ClientModInitializer {
 
     private static void stop(Minecraft mc) {
         active = false;
+        straightMode = false;
+        wasPaused = false;
+        tracking = false;
         targetX = targetZ = null;
         fixedYaw = null;
         releaseKeys(mc);
@@ -129,11 +148,37 @@ public class AutoBoatMod implements ClientModInitializer {
     }
 
     private static void tick(Minecraft mc) {
-        if (!active || mc.player == null || mc.level == null) return;
+        if (!active || mc.player == null || mc.level == null) {
+            tracking = false;
+            return;
+        }
 
         if (!(mc.player.getVehicle() instanceof Boat boat)) {
             releaseKeys(mc);
+            tracking = false;
+            wasPaused = false;
             return; // не в лодке — ждём
+        }
+
+        // Текущий угол и скорость вращения лодки (градусов за тик)
+        float yaw = boat.getYRot();
+        if (!tracking) { lastYaw = yaw; tracking = true; }
+        float rate = Mth.wrapDegrees(yaw - lastYaw);
+        lastYaw = yaw;
+
+        // Пауза: пока зажата клавиша — рулишь сам
+        if (pauseKey.isDown()) {
+            releaseKeys(mc);
+            wasPaused = true;
+            return;
+        }
+        if (wasPaused) {
+            wasPaused = false;
+            if (straightMode) {
+                // Новый курс = куда лодка смотрит (с учётом инерции поворота)
+                fixedYaw = Mth.wrapDegrees(yaw + rate * INERTIA);
+                mc.player.displayClientMessage(Component.literal("AutoBoat: курс обновлён"), true);
+            }
         }
 
         // Желаемое направление
@@ -164,14 +209,8 @@ public class AutoBoatMod implements ClientModInitializer {
         }
 
         Options o = mc.options;
-        float yaw = boat.getYRot();
-        if (!keysHeld) lastYaw = yaw;
         keysHeld = true;
         o.keyDown.setDown(false);
-
-        // Скорость вращения лодки (градусов за тик) — чтобы не проскакивать курс
-        float rate = Mth.wrapDegrees(yaw - lastYaw);
-        lastYaw = yaw;
 
         if (chosen == null) {
             // Всё перекрыто — крутимся на месте без газа
